@@ -1,5 +1,5 @@
 "use client";
-import { GoogleMap, LoadScript, DrawingManager } from "@react-google-maps/api";
+import { GoogleMap, LoadScript, DrawingManager, InfoWindow } from "@react-google-maps/api";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getBoundsFromShape, generatePinsWithinBounds } from "../utils/bounds";
 
@@ -18,6 +18,10 @@ export type MapWithDrawingProps = {
   // Refinement options
   pinSnapToGrid?: boolean;
   pinGridSizeDeg?: number; // e.g., 0.001 degrees ~ 100m
+  // Address info window on hover
+  showAddressHoverInfo?: boolean;
+  // Deprecated: kept for backward compatibility
+  showAddressInfoWindow?: boolean;
 };
 
 const defaultContainer = { width: "100%", height: "500px" } as const;
@@ -37,7 +41,15 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     showAirQualityMeter = true,
     pinSnapToGrid = false,
     pinGridSizeDeg = 0.001,
+    showAddressHoverInfo,
+    showAddressInfoWindow,
   } = props;
+
+  // Compute final flag with backward compatibility
+  const addressHover =
+    typeof showAddressHoverInfo === "boolean"
+      ? showAddressHoverInfo
+      : showAddressInfoWindow ?? true;
 
   const [drawingMode, setDrawingMode] =
     useState<google.maps.drawing.OverlayType | null>(null);
@@ -56,6 +68,12 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
   // Air quality meter element host and ref
   const meterHostRef = useRef<HTMLDivElement | null>(null);
   const meterElRef = useRef<any>(null);
+  // Hover InfoWindow state
+  const [hoverPosition, setHoverPosition] = useState<google.maps.LatLngLiteral | null>(null);
+  const [hoverAddress, setHoverAddress] = useState<string>("");
+  const geocodeCache = useRef<Map<string, string>>(new Map());
+  const placesRef = useRef<google.maps.places.PlacesService | null>(null);
+  const geocodeReqId = useRef(0);
 
   const clearShape = useCallback(() => {
     if (shapeRef.current) {
@@ -150,6 +168,22 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
         };
         marker.addListener("gmp-click", handleCtrlClickFallback as any);
         marker.addListener("click", handleCtrlClickFallback as any);
+
+        // Hover events for simulated pins
+        const onEnter = () => {
+          if (!addressHover) return;
+          setHoverAddress("");
+          setHoverPosition(p);
+          reverseGeocode(p);
+        };
+        const onLeave = () => {
+          setHoverPosition(null);
+          setHoverAddress("");
+        };
+        marker.addListener("gmp-mouseover", onEnter as any);
+        marker.addListener("mouseover", onEnter as any);
+        marker.addListener("gmp-mouseout", onLeave as any);
+        marker.addListener("mouseout", onLeave as any);
         return marker;
       });
     }
@@ -174,6 +208,21 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
           if (p) onCenterChange(p);
         },
       );
+      // Hover events for center marker
+      const onEnter = () => {
+        if (!addressHover) return;
+        setHoverAddress("");
+        setHoverPosition(center);
+        reverseGeocode(center);
+      };
+      const onLeave = () => {
+        setHoverPosition(null);
+        setHoverAddress("");
+      };
+      markerRef.current.addListener("gmp-mouseover", onEnter as any);
+      markerRef.current.addListener("mouseover", onEnter as any);
+      markerRef.current.addListener("gmp-mouseout", onLeave as any);
+      markerRef.current.addListener("mouseout", onLeave as any);
     } else {
       markerRef.current.position = center;
       if (!markerRef.current.map) markerRef.current.map = mapRef.current;
@@ -189,6 +238,28 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     }
   }, [center, onCenterChange]);
 
+  // Helper: reverse geocode with caching
+  const reverseGeocode = useCallback((pos: google.maps.LatLngLiteral) => {
+    const key = `${pos.lat.toFixed(6)},${pos.lng.toFixed(6)}`;
+    const cached = geocodeCache.current.get(key);
+    if (cached !== undefined) {
+      setHoverAddress(cached);
+      return;
+    }
+    const reqId = ++geocodeReqId.current;
+    try {
+      const geocoder = new google.maps.Geocoder();
+      geocoder.geocode({ location: pos }, (results, status) => {
+        if (reqId !== geocodeReqId.current) return; // stale response
+        const addr = status === "OK" && results && results[0] ? results[0].formatted_address ?? "" : "";
+        geocodeCache.current.set(key, addr);
+        setHoverAddress(addr);
+      });
+    } catch {
+      if (reqId === geocodeReqId.current) setHoverAddress("");
+    }
+  }, []);
+
   return (
     <LoadScript googleMapsApiKey={apiKey} libraries={libraries}>
       <div style={{ position: "relative", width: "100%", height: containerStyle.height }}>
@@ -200,13 +271,48 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
             mapTypeId: "roadmap",
             disableDefaultUI: true,
             zoomControl: true,
+            clickableIcons: true,
             mapId,
           }}
           onLoad={(map) => {
             mapRef.current = map;
+            // Initialize Places service
+            try {
+              placesRef.current = new google.maps.places.PlacesService(map);
+            } catch {
+              placesRef.current = null;
+            }
+            // Map click: if POI, show its details; else reverse-geocode clicked position
             map.addListener("click", (e: google.maps.MapMouseEvent) => {
               const p = e.latLng?.toJSON();
-              if (p) onCenterChange(p);
+              // If user clicked a POI, use placeId to fetch details and show
+              if ((e as any).placeId) {
+                (e as any).stop();
+                const placeId = (e as any).placeId as string;
+                if (placesRef.current) {
+                  setHoverAddress("");
+                  placesRef.current.getDetails(
+                    { placeId, fields: ["name", "formatted_address", "geometry", "url"] },
+                    (place, status) => {
+                      if (status === google.maps.places.PlacesServiceStatus.OK && place) {
+                        const pos = place.geometry?.location?.toJSON() ?? p!;
+                        setHoverPosition(pos);
+                        const title = place.name ?? "";
+                        const addr = place.formatted_address ?? "";
+                        setHoverAddress(title ? `${title}, ${addr}` : addr);
+                      }
+                    },
+                  );
+                }
+                return;
+              }
+              // Non-POI: show address for clicked lat/lng and also update center
+              if (p) {
+                setHoverAddress("");
+                setHoverPosition(p);
+                reverseGeocode(p);
+                onCenterChange(p);
+              }
             });
             map.addListener("dragstart", () => {
               isUserDraggingRef.current = true;
@@ -335,6 +441,39 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
               },
             }}
           />
+          {addressHover && hoverPosition && (
+            <InfoWindow position={hoverPosition} options={{ disableAutoPan: false }}>
+              <div className="max-w-xs rounded-md border bg-card p-2 text-card-foreground shadow">
+                {hoverAddress ? (
+                  <div className="space-y-1">
+                    <div className="font-medium leading-snug">
+                      <span className="rounded bg-primary/15 px-1">
+                        {hoverAddress.split(",")[0]}
+                      </span>
+                    </div>
+                    <div className="text-sm text-muted-foreground">
+                      {hoverAddress.split(",").slice(1).join(",").trim()}
+                    </div>
+                    <a
+                      className="text-primary text-sm underline"
+                      href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+                        `${hoverPosition.lat},${hoverPosition.lng}`,
+                      )}`}
+                      target="_blank"
+                      rel="noreferrer"
+                    >
+                      View on Google Maps
+                    </a>
+                  </div>
+                ) : (
+                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                    <span className="inline-block h-3 w-3 animate-pulse rounded-full bg-muted" />
+                    Fetching address…
+                  </div>
+                )}
+              </div>
+            </InfoWindow>
+          )}
         </GoogleMap>
       </div>
     </LoadScript>
