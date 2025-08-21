@@ -14,6 +14,7 @@ export type MapWithDrawingProps = {
   defaultZoom?: number;
   containerStyle?: { width: string; height: string };
   centerChangeZoom?: number;
+  showAirQualityMeter?: boolean;
 };
 
 const defaultContainer = { width: "100%", height: "500px" } as const;
@@ -30,6 +31,7 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     defaultZoom = 12,
     containerStyle = defaultContainer,
     centerChangeZoom,
+    showAirQualityMeter = true,
   } = props;
 
   const [drawingMode, setDrawingMode] =
@@ -45,6 +47,9 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     null,
   );
   const simMarkerRefs = useRef<google.maps.marker.AdvancedMarkerElement[]>([]);
+  // Air quality meter element host and ref
+  const meterHostRef = useRef<HTMLDivElement | null>(null);
+  const meterElRef = useRef<any>(null);
 
   const clearShape = useCallback(() => {
     if (shapeRef.current) {
@@ -132,6 +137,10 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     if (typeof centerChangeZoom === "number") {
       mapRef.current?.setZoom(centerChangeZoom);
     }
+    // Update Air Quality meter location when center changes
+    if (meterElRef.current) {
+      meterElRef.current.setAttribute("location", `${center.lat},${center.lng}`);
+    }
   }, [center, onCenterChange]);
 
   return (
@@ -155,6 +164,27 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
             });
           }}
         >
+          {showAirQualityMeter && (
+            <div
+              ref={meterHostRef}
+              className="absolute bottom-4 left-4 z-10"
+              style={{ pointerEvents: "auto" }}
+            >
+              {/* We attach the custom element on first render */}
+              {!meterElRef.current && (
+                <AirQualityMount
+                  center={center}
+                  onReady={(el) => {
+                    meterElRef.current = el;
+                    // Also append into host to ensure it's in DOM
+                    if (meterHostRef.current && el && !meterHostRef.current.contains(el)) {
+                      meterHostRef.current.appendChild(el);
+                    }
+                  }}
+                />
+              )}
+            </div>
+          )}
           {!boundaryApplied && (
             <div
               className="-translate-x-1/2 absolute top-10 left-1/2 z-10 transform rounded-lg bg-white p-2 text-center opacity-80 shadow-lg transition-opacity duration-300 hover:opacity-100 lg:top-2"
@@ -254,4 +284,32 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
       </div>
     </LoadScript>
   );
+}
+
+// Helper component to mount the Air Quality custom element lazily
+function AirQualityMount({
+  center,
+  onReady,
+}: {
+  center: google.maps.LatLngLiteral;
+  onReady: (el: any) => void;
+}) {
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    // Always create the custom element tag; avoid experimental constructors
+    const el: any = document.createElement("gmp-air-quality-meter");
+    el.setAttribute("location", `${center.lat},${center.lng}`);
+    if (containerRef.current) containerRef.current.appendChild(el);
+    onReady(el);
+    return () => {
+      try {
+        if (containerRef.current && el && containerRef.current.contains(el)) {
+          containerRef.current.removeChild(el);
+        }
+      } catch {
+        // noop
+      }
+    };
+  }, []);
+  return <div ref={containerRef} />;
 }
