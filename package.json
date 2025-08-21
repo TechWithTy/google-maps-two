@@ -1,0 +1,27 @@
+{
+  "name": "@dealscale/google-maps-two",
+  "version": "0.1.0",
+  "private": false,
+  "description": "Reusable Google Maps components and utils (drawing, geometry) for React/Next.js.",
+  "license": "MIT",
+  "author": {
+    "name": "CyberOni Software Solutions",
+    "url": "https://github.com/techwithty"
+  },
+  "type": "module",
+  "sideEffects": false,
+  "exports": {
+    "./components": "./components/index.ts",
+    "./utils": "./utils/index.ts"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "react-dom": ">=18",
+    "next": ">=14",
+    "@react-google-maps/api": ">=2.19.3"
+  },
+  "devDependencies": {
+    "@types/google.maps": ">=3.58.1",
+    "typescript": ">=5.6.2"
+  }
+}
