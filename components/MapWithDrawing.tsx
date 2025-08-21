@@ -22,6 +22,18 @@ export type MapWithDrawingProps = {
   showAddressHoverInfo?: boolean;
   // Deprecated: kept for backward compatibility
   showAddressInfoWindow?: boolean;
+  // Address validation (Preview API)
+  enableAddressValidation?: boolean;
+  validationRegionCode?: string; // default US
+  validationLanguageCode?: string; // default en
+  // Pre-render validation for pins
+  validatePinsBeforeRender?: boolean; // default true
+  onPinValidated?: (payload: {
+    pin: google.maps.LatLngLiteral;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    validation: any | null;
+    formattedAddress: string;
+  }) => void;
 };
 
 const defaultContainer = { width: "100%", height: "500px" } as const;
@@ -43,6 +55,11 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     pinGridSizeDeg = 0.001,
     showAddressHoverInfo,
     showAddressInfoWindow,
+    enableAddressValidation = false,
+    validationRegionCode = "US",
+    validationLanguageCode = "en",
+    validatePinsBeforeRender = true,
+    onPinValidated,
   } = props;
 
   // Compute final flag with backward compatibility
@@ -71,15 +88,66 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
   // Hover InfoWindow state
   const [hoverPosition, setHoverPosition] = useState<google.maps.LatLngLiteral | null>(null);
   const [hoverAddress, setHoverAddress] = useState<string>("");
+  const [hoverDetails, setHoverDetails] = useState<{
+    name?: string;
+    url?: string;
+    website?: string;
+    phone?: string;
+    rating?: number;
+    userRatingsTotal?: number;
+    openNow?: boolean;
+  } | null>(null);
   const geocodeCache = useRef<Map<string, string>>(new Map());
   const placesRef = useRef<google.maps.places.PlacesService | null>(null);
   const geocodeReqId = useRef(0);
+  const [validating, setValidating] = useState(false);
+  const [validation, setValidation] = useState<any | null>(null);
+  // Suppress hover popover right after a click to avoid double popover
+  const suppressHoverRef = useRef(false);
 
   const clearShape = useCallback(() => {
     if (shapeRef.current) {
       shapeRef.current.setMap(null);
       shapeRef.current = null;
     }
+  }, []);
+
+  // Get validation result without touching component UI state
+  const fetchAddressValidation = useCallback(async (address: string) => {
+    if (!enableAddressValidation || !address) return null;
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { AddressValidation }: any = await (google.maps as any).importLibrary("addressValidation");
+      const result = await AddressValidation.fetchAddressValidation({
+        address: {
+          addressLines: [address],
+          regionCode: validationRegionCode,
+          languageCode: validationLanguageCode,
+        },
+      });
+      return result;
+    } catch {
+      return null;
+    }
+  }, [enableAddressValidation, validationRegionCode, validationLanguageCode]);
+
+  // Reverse geocode but return the formatted address without touching UI state
+  const reverseGeocodeOnce = useCallback(async (pos: google.maps.LatLngLiteral): Promise<string> => {
+    const key = `${pos.lat.toFixed(6)},${pos.lng.toFixed(6)}`;
+    const cached = geocodeCache.current.get(key);
+    if (cached) return cached;
+    return new Promise<string>((resolve) => {
+      try {
+        const geocoder = new google.maps.Geocoder();
+        geocoder.geocode({ location: pos }, (results, status) => {
+          const addr = status === "OK" && results && results[0] ? results[0].formatted_address ?? "" : "";
+          geocodeCache.current.set(key, addr);
+          resolve(addr);
+        });
+      } catch {
+        resolve("");
+      }
+    });
   }, []);
 
   const onShapeComplete = useCallback(
@@ -120,14 +188,16 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
   // Render simulated pins as AdvancedMarkers (draggable; dblclick to delete)
   useEffect(() => {
     if (!mapRef.current) return;
+    // Clear previous sim markers
     for (const m of simMarkerRefs.current) m.map = null;
     simMarkerRefs.current = [];
-    if (window.google?.maps?.marker?.AdvancedMarkerElement) {
-      simMarkerRefs.current = results.map((p, idx) => {
-        const marker = new window.google.maps.marker.AdvancedMarkerElement({
+    if (results && results.length) {
+      const buildMarker = (p: google.maps.LatLngLiteral, index: number) => {
+        const marker = new google.maps.marker.AdvancedMarkerElement({
           map: mapRef.current!,
           position: p,
           gmpDraggable: true,
+          zIndex: 10,
         });
         marker.addListener("dragend", (e: google.maps.MapMouseEvent) => {
           const pos = e.latLng?.toJSON();
@@ -138,59 +208,62 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
             const snap = (v: number, step: number) => Math.round(v / step) * step;
             newPos = { lat: snap(pos.lat, pinGridSizeDeg), lng: snap(pos.lng, pinGridSizeDeg) };
           }
-          next[idx] = newPos;
+          next[index] = newPos;
           onResultsChange(next);
+          // After snapping, validate the new address for analytics/UX
+          (async () => {
+            const addr = await reverseGeocodeOnce(newPos);
+            const val = await fetchAddressValidation(addr);
+            onPinValidated?.({ pin: newPos, validation: val, formattedAddress: addr });
+          })();
         });
-        const handleCtrlDoubleClick = (ev: any) => {
-          const ctrl = ev?.ctrlKey ?? ev?.domEvent?.ctrlKey ?? false;
-          if (!ctrl) return;
-          const next = results.slice();
-          next.splice(idx, 1);
-          onResultsChange(next);
-        };
-        // Support AdvancedMarker and regular double-click events
-        marker.addListener("gmp-dblclick", handleCtrlDoubleClick as any);
-        marker.addListener("dblclick", handleCtrlDoubleClick as any);
-        // Fallback: detect two ctrl+clicks within threshold
-        let lastCtrlClick = 0;
-        const handleCtrlClickFallback = (ev: any) => {
-          const ctrl = ev?.ctrlKey ?? ev?.domEvent?.ctrlKey ?? false;
-          if (!ctrl) return;
-          const now = Date.now();
-          if (now - lastCtrlClick < 350) {
-            const next = results.slice();
-            next.splice(idx, 1);
-            onResultsChange(next);
-            lastCtrlClick = 0;
-          } else {
-            lastCtrlClick = now;
-          }
-        };
-        marker.addListener("gmp-click", handleCtrlClickFallback as any);
-        marker.addListener("click", handleCtrlClickFallback as any);
-
         // Hover events for simulated pins
         const onEnter = () => {
           if (!addressHover) return;
+          if (suppressHoverRef.current) return;
           setHoverAddress("");
+          setHoverDetails(null);
+          setValidation(null);
           setHoverPosition(p);
           reverseGeocode(p);
         };
         const onLeave = () => {
           setHoverPosition(null);
           setHoverAddress("");
+          setHoverDetails(null);
+          setValidation(null);
         };
         marker.addListener("gmp-mouseover", onEnter as any);
         marker.addListener("mouseover", onEnter as any);
         marker.addListener("gmp-mouseout", onLeave as any);
         marker.addListener("mouseout", onLeave as any);
         return marker;
-      });
+      };
+
+      if (validatePinsBeforeRender) {
+        // Validate pins sequentially before rendering to the map
+        (async () => {
+          const newMarkers: google.maps.marker.AdvancedMarkerElement[] = [];
+          for (let i = 0; i < results.length; i++) {
+            const p = results[i];
+            const addr = await reverseGeocodeOnce(p);
+            const val = await fetchAddressValidation(addr);
+            onPinValidated?.({ pin: p, validation: val, formattedAddress: addr });
+            // Regardless of verdict, we still render; adjust here if you want to filter
+            const m = buildMarker(p, i);
+            newMarkers.push(m);
+          }
+          simMarkerRefs.current = newMarkers;
+        })();
+      } else {
+        simMarkerRefs.current = results.map((p, i) => buildMarker(p, i));
+      }
     }
     return () => {
       for (const m of simMarkerRefs.current) m.map = null;
     };
-  }, [results, onResultsChange, pinSnapToGrid, pinGridSizeDeg]);
+  // Note: reverseGeocode is intentionally omitted to avoid TDZ during initial render since it's defined later.
+  }, [results, addressHover, onResultsChange, pinSnapToGrid, pinGridSizeDeg, reverseGeocodeOnce, fetchAddressValidation, validatePinsBeforeRender, onPinValidated]);
 
   // Initialize / update AdvancedMarker for primary pin
   useEffect(() => {
@@ -211,13 +284,18 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
       // Hover events for center marker
       const onEnter = () => {
         if (!addressHover) return;
+        if (suppressHoverRef.current) return;
         setHoverAddress("");
+        setHoverDetails(null);
+        setValidation(null);
         setHoverPosition(center);
         reverseGeocode(center);
       };
       const onLeave = () => {
         setHoverPosition(null);
         setHoverAddress("");
+        setHoverDetails(null);
+        setValidation(null);
       };
       markerRef.current.addListener("gmp-mouseover", onEnter as any);
       markerRef.current.addListener("mouseover", onEnter as any);
@@ -260,6 +338,31 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     }
   }, []);
 
+  // Address Validation (optional, Preview API)
+  const validateAddressIfEnabled = useCallback(async (address: string) => {
+    if (!enableAddressValidation || !address) return;
+    setValidating(true);
+    setValidation(null);
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const { AddressValidation }: any = await (google.maps as any).importLibrary("addressValidation");
+      const result = await AddressValidation.fetchAddressValidation({
+        address: {
+          addressLines: [address],
+          regionCode: validationRegionCode,
+          languageCode: validationLanguageCode,
+        },
+      });
+      setValidation(result);
+    } catch {
+      setValidation(null);
+    } finally {
+      setValidating(false);
+    }
+  }, [enableAddressValidation, validationRegionCode, validationLanguageCode]);
+
+  
+
   return (
     <LoadScript googleMapsApiKey={apiKey} libraries={libraries}>
       <div style={{ position: "relative", width: "100%", height: containerStyle.height }}>
@@ -284,15 +387,36 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
             }
             // Map click: if POI, show its details; else reverse-geocode clicked position
             map.addListener("click", (e: google.maps.MapMouseEvent) => {
+              suppressHoverRef.current = true;
+              setTimeout(() => {
+                suppressHoverRef.current = false;
+              }, 600);
               const p = e.latLng?.toJSON();
               // If user clicked a POI, use placeId to fetch details and show
               if ((e as any).placeId) {
-                (e as any).stop();
+                if (typeof (e as any).stop === "function") (e as any).stop();
                 const placeId = (e as any).placeId as string;
                 if (placesRef.current) {
                   setHoverAddress("");
+                  setHoverDetails(null);
+                  setValidation(null);
                   placesRef.current.getDetails(
-                    { placeId, fields: ["name", "formatted_address", "geometry", "url"] },
+                    {
+                      placeId,
+                      fields: [
+                        "name",
+                        "formatted_address",
+                        "geometry",
+                        "url",
+                        "website",
+                        "international_phone_number",
+                        "opening_hours",
+                        "rating",
+                        "user_ratings_total",
+                        "types",
+                        "place_id",
+                      ],
+                    },
                     (place, status) => {
                       if (status === google.maps.places.PlacesServiceStatus.OK && place) {
                         const pos = place.geometry?.location?.toJSON() ?? p!;
@@ -300,6 +424,17 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
                         const title = place.name ?? "";
                         const addr = place.formatted_address ?? "";
                         setHoverAddress(title ? `${title}, ${addr}` : addr);
+                        const openNow = place.opening_hours?.isOpen?.() ?? undefined;
+                        setHoverDetails({
+                          name: place.name ?? undefined,
+                          url: place.url ?? undefined,
+                          website: place.website ?? undefined,
+                          phone: place.international_phone_number ?? undefined,
+                          rating: place.rating ?? undefined,
+                          userRatingsTotal: place.user_ratings_total ?? undefined,
+                          openNow,
+                        });
+                        validateAddressIfEnabled(addr || title);
                       }
                     },
                   );
@@ -309,9 +444,16 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
               // Non-POI: show address for clicked lat/lng and also update center
               if (p) {
                 setHoverAddress("");
+                setHoverDetails(null);
+                setValidation(null);
                 setHoverPosition(p);
                 reverseGeocode(p);
                 onCenterChange(p);
+                // Run validation after reverse geocode fills address
+                // Defer slightly to allow reverseGeocode state to populate
+                setTimeout(() => {
+                  validateAddressIfEnabled(geocodeCache.current.get(`${p.lat.toFixed(6)},${p.lng.toFixed(6)}`) || "");
+                }, 150);
               }
             });
             map.addListener("dragstart", () => {
@@ -443,27 +585,68 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
           />
           {addressHover && hoverPosition && (
             <InfoWindow position={hoverPosition} options={{ disableAutoPan: false }}>
-              <div className="max-w-xs rounded-md border bg-card p-2 text-card-foreground shadow">
+              <div className="max-w-xs rounded-md border bg-popover p-3 text-popover-foreground shadow">
                 {hoverAddress ? (
-                  <div className="space-y-1">
-                    <div className="font-medium leading-snug">
+                  <div className="space-y-1.5">
+                    <div className="font-semibold leading-snug">
                       <span className="rounded bg-primary/15 px-1">
-                        {hoverAddress.split(",")[0]}
+                        {hoverDetails?.name ?? hoverAddress.split(",")[0]}
                       </span>
                     </div>
                     <div className="text-sm text-muted-foreground">
-                      {hoverAddress.split(",").slice(1).join(",").trim()}
+                      {hoverDetails?.name ? hoverAddress.replace(/^.*?,\s*/, "") : hoverAddress.split(",").slice(1).join(",").trim()}
                     </div>
-                    <a
-                      className="text-primary text-sm underline"
-                      href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-                        `${hoverPosition.lat},${hoverPosition.lng}`,
-                      )}`}
-                      target="_blank"
-                      rel="noreferrer"
-                    >
-                      View on Google Maps
-                    </a>
+                    {typeof hoverDetails?.rating === "number" && (
+                      <div className="text-xs text-muted-foreground">
+                        Rating: <span className="font-medium text-foreground">{hoverDetails.rating.toFixed(1)}</span>
+                        {typeof hoverDetails.userRatingsTotal === "number" && ` (${hoverDetails.userRatingsTotal})`}
+                      </div>
+                    )}
+                    {typeof hoverDetails?.openNow === "boolean" && (
+                      <div className="text-xs">
+                        <span className={`rounded px-1 ${hoverDetails.openNow ? "bg-green-500/15 text-green-600" : "bg-red-500/15 text-red-600"}`}>
+                          {hoverDetails.openNow ? "Open now" : "Closed now"}
+                        </span>
+                      </div>
+                    )}
+                    {hoverDetails?.phone && (
+                      <div className="text-xs text-muted-foreground">{hoverDetails.phone}</div>
+                    )}
+                    <div className="flex flex-wrap gap-3 pt-1">
+                      <a
+                        className="text-primary text-sm underline"
+                        href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+                          `${hoverPosition.lat},${hoverPosition.lng}`,
+                        )}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        View on Google Maps
+                      </a>
+                      {hoverDetails?.website && (
+                        <a className="text-primary text-sm underline" href={hoverDetails.website} target="_blank" rel="noreferrer">
+                          Website
+                        </a>
+                      )}
+                      {hoverDetails?.url && (
+                        <a className="text-primary text-sm underline" href={hoverDetails.url} target="_blank" rel="noreferrer">
+                          Place page
+                        </a>
+                      )}
+                    </div>
+                    {validation && (
+                      <div className="mt-2 rounded border bg-card p-2 text-xs">
+                        <div className="font-medium">Validation</div>
+                        <div className="text-muted-foreground">Formatted: {validation.address?.formattedAddress || ""}</div>
+                        <div className="text-muted-foreground">Entered: {validation.verdict?.inputGranularity || ""}</div>
+                        <div className="text-muted-foreground">Validated: {validation.verdict?.validationGranularity || ""}</div>
+                        <div className="text-muted-foreground">Complete: {String(validation.verdict?.addressComplete)}</div>
+                        <div className="text-muted-foreground">Unconfirmed: {String(validation.verdict?.hasUnconfirmedComponents)}</div>
+                      </div>
+                    )}
+                    {validating && (
+                      <div className="text-xs text-muted-foreground">Validating…</div>
+                    )}
                   </div>
                 ) : (
                   <div className="flex items-center gap-2 text-sm text-muted-foreground">
