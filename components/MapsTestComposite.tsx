@@ -2,7 +2,7 @@
 import { useEffect, useState } from "react";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { NestedMapDialog } from "@/external/google-maps/components/Controls/NestedMapDialog";
+import { NestedMapDialog } from "@/external/google-maps-two/components/Controls/NestedMapDialog";
 import { MapWithDrawing } from "./MapWithDrawing";
 
 const defaultCenter: google.maps.LatLngLiteral = {
