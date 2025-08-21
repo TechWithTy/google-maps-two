@@ -34,6 +34,8 @@ export type MapWithDrawingProps = {
     validation: any | null;
     formattedAddress: string;
   }) => void;
+  // Map color scheme: light, dark, or follow system/app theme
+  mapColorScheme?: "light" | "dark" | "system";
 };
 
 const defaultContainer = { width: "100%", height: "500px" } as const;
@@ -60,6 +62,7 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     validationLanguageCode = "en",
     validatePinsBeforeRender = true,
     onPinValidated,
+    mapColorScheme = "system",
   } = props;
 
   // Compute final flag with backward compatibility
@@ -104,6 +107,9 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
   const [validation, setValidation] = useState<any | null>(null);
   // Suppress hover popover right after a click to avoid double popover
   const suppressHoverRef = useRef(false);
+  // Color scheme readiness and enum
+  const [colorSchemeEnum, setColorSchemeEnum] = useState<google.maps.ColorScheme | undefined>(undefined);
+  const [googleReady, setGoogleReady] = useState(false);
 
   const clearShape = useCallback(() => {
     if (shapeRef.current) {
@@ -111,6 +117,90 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
       shapeRef.current = null;
     }
   }, []);
+
+  // Load ColorScheme enum and resolve which scheme to use before map init
+  useEffect(() => {
+    if (!googleReady) return;
+    let mounted = true;
+    (async () => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const core: any = await (google.maps as any).importLibrary("core");
+        const CS: typeof google.maps.ColorScheme = core.ColorScheme ?? (google.maps as any).ColorScheme;
+        if (!mounted || !CS) return;
+        if (mapColorScheme === "light") {
+          setColorSchemeEnum(CS.LIGHT);
+          return;
+        }
+        if (mapColorScheme === "dark") {
+          setColorSchemeEnum(CS.DARK);
+          return;
+        }
+        // system: force dark initially if app or system prefers dark; otherwise follow system
+        const prefersAppDark = typeof document !== "undefined" && document.documentElement.classList.contains("dark");
+        const mql = typeof window !== "undefined" ? window.matchMedia("(prefers-color-scheme: dark)") : undefined;
+        const prefersSystemDark = !!mql?.matches;
+        setColorSchemeEnum(prefersAppDark || prefersSystemDark ? CS.DARK : CS.FOLLOW_SYSTEM);
+      } catch {
+        // Fallback: no enum -> undefined (map will use default light)
+        setColorSchemeEnum(undefined);
+      }
+    })();
+    return () => {
+      mounted = false;
+    };
+  }, [googleReady, mapColorScheme]);
+
+  // Track theme changes and remount map when scheme should change
+  const [mapKey, setMapKey] = useState(0);
+  useEffect(() => {
+    if (!googleReady) return;
+    let disposed = false;
+    let observer: MutationObserver | null = null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let CS: typeof google.maps.ColorScheme | undefined;
+    // Setup listeners only for system mode
+    if (mapColorScheme !== "system") return;
+    (async () => {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const core: any = await (google.maps as any).importLibrary("core");
+        CS = core.ColorScheme ?? (google.maps as any).ColorScheme;
+      } catch {
+        CS = undefined;
+      }
+      if (disposed) return;
+      const mql = window.matchMedia("(prefers-color-scheme: dark)");
+      const evalAndSet = () => {
+        const prefersAppDark = document.documentElement.classList.contains("dark");
+        if (!CS) return;
+        const next = prefersAppDark || mql.matches ? CS.DARK : CS.FOLLOW_SYSTEM;
+        setColorSchemeEnum((prev) => {
+          if (prev !== next) {
+            setMapKey((k) => k + 1); // force remount of GoogleMap
+          }
+          return next;
+        });
+      };
+      const mqlHandler = () => evalAndSet();
+      mql.addEventListener?.("change", mqlHandler);
+      // Observe html class changes
+      observer = new MutationObserver(evalAndSet);
+      observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+      // Initial check
+      evalAndSet();
+      // Cleanup
+      return () => {
+        mql.removeEventListener?.("change", mqlHandler);
+      };
+    })();
+    return () => {
+      disposed = true;
+      if (observer) {
+        observer.disconnect();
+      }
+    };
+  }, [googleReady, mapColorScheme]);
 
   // Get validation result without touching component UI state
   const fetchAddressValidation = useCallback(async (address: string) => {
@@ -355,48 +445,52 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
       });
       setValidation(result);
     } catch {
-      setValidation(null);
+      // noop
     } finally {
       setValidating(false);
     }
   }, [enableAddressValidation, validationRegionCode, validationLanguageCode]);
 
-  
-
   return (
-    <LoadScript googleMapsApiKey={apiKey} libraries={libraries}>
-      <div style={{ position: "relative", width: "100%", height: containerStyle.height }}>
-        <GoogleMap
-          mapContainerStyle={containerStyle}
-          center={center}
-          zoom={defaultZoom}
-          options={{
-            mapTypeId: "roadmap",
-            disableDefaultUI: true,
-            zoomControl: true,
-            clickableIcons: true,
-            mapId,
-          }}
-          onLoad={(map) => {
-            mapRef.current = map;
-            // Initialize Places service
-            try {
-              placesRef.current = new google.maps.places.PlacesService(map);
-            } catch {
-              placesRef.current = null;
-            }
-            // Map click: if POI, show its details; else reverse-geocode clicked position
-            map.addListener("click", (e: google.maps.MapMouseEvent) => {
-              suppressHoverRef.current = true;
-              setTimeout(() => {
-                suppressHoverRef.current = false;
-              }, 600);
-              const p = e.latLng?.toJSON();
-              // If user clicked a POI, use placeId to fetch details and show
-              if ((e as any).placeId) {
-                if (typeof (e as any).stop === "function") (e as any).stop();
-                const placeId = (e as any).placeId as string;
-                if (placesRef.current) {
+    <LoadScript
+      googleMapsApiKey={apiKey}
+      libraries={libraries}
+      onLoad={() => setGoogleReady(true)}
+    >
+    <div style={{ position: "relative", width: "100%", height: containerStyle.height }}>
+      <GoogleMap
+        key={`map-${mapKey}-${colorSchemeEnum ?? "default"}`}
+        mapContainerStyle={containerStyle}
+        center={center}
+        zoom={defaultZoom}
+        options={{
+          mapTypeId: "roadmap",
+          disableDefaultUI: true,
+          clickableIcons: true,
+          gestureHandling: "greedy",
+          backgroundColor: "#0B0B0C",
+          ...(colorSchemeEnum ? { colorScheme: colorSchemeEnum } : {}),
+          mapId: mapId,
+        }}
+        onLoad={(map) => {
+          mapRef.current = map;
+          try {
+            placesRef.current = new google.maps.places.PlacesService(map);
+          } catch {
+            placesRef.current = null;
+          }
+          // Map click: if POI, show its details; else reverse-geocode clicked position
+          map.addListener("click", (e: google.maps.MapMouseEvent) => {
+            suppressHoverRef.current = true;
+            setTimeout(() => {
+              suppressHoverRef.current = false;
+            }, 600);
+            const p = e.latLng?.toJSON();
+            // If user clicked a POI, use placeId to fetch details and show
+            if ((e as any).placeId) {
+              if (typeof (e as any).stop === "function") (e as any).stop();
+              const placeId = (e as any).placeId as string;
+              if (placesRef.current) {
                   setHoverAddress("");
                   setHoverDetails(null);
                   setValidation(null);
