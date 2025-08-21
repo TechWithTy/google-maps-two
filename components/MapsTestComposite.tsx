@@ -75,20 +75,18 @@ export function MapsTestComposite() {
         />
       </div>
       <MapWithDrawing
-        apiKey={
-          process.env.NEXT_PUBLIC_GMAPS_KEY ||
-          process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ||
-          ""
-        }
-        mapId={process.env.NEXT_PUBLIC_GMAPS_MAP_ID}
-        center={coords}
-        onCenterChange={(c) => setCoords(c)}
-        results={simulatedPins}
-        onResultsChange={(pins) => setSimulatedPins(pins)}
-        defaultZoom={12}
-        containerStyle={mapContainerStyle}
-        centerChangeZoom={16}
-      />
+  apiKey={process.env.NEXT_PUBLIC_GMAPS_KEY || process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || ""}
+  mapId={process.env.NEXT_PUBLIC_GMAPS_MAP_ID}
+  center={coords}
+  onCenterChange={(c) => setCoords(c)}
+  results={simulatedPins}
+  onResultsChange={(pins) => setSimulatedPins(pins)}
+  defaultZoom={12}
+  containerStyle={mapContainerStyle}
+  centerChangeZoom={16}
+  pinSnapToGrid={true}
+  pinGridSizeDeg={0.001}
+/>
     </main>
   );
 }

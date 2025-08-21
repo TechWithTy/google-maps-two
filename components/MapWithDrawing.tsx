@@ -15,6 +15,9 @@ export type MapWithDrawingProps = {
   containerStyle?: { width: string; height: string };
   centerChangeZoom?: number;
   showAirQualityMeter?: boolean;
+  // Refinement options
+  pinSnapToGrid?: boolean;
+  pinGridSizeDeg?: number; // e.g., 0.001 degrees ~ 100m
 };
 
 const defaultContainer = { width: "100%", height: "500px" } as const;
@@ -32,6 +35,8 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     containerStyle = defaultContainer,
     centerChangeZoom,
     showAirQualityMeter = true,
+    pinSnapToGrid = false,
+    pinGridSizeDeg = 0.001,
   } = props;
 
   const [drawingMode, setDrawingMode] =
@@ -47,6 +52,7 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     null,
   );
   const simMarkerRefs = useRef<google.maps.marker.AdvancedMarkerElement[]>([]);
+  const isUserDraggingRef = useRef(false);
   // Air quality meter element host and ref
   const meterHostRef = useRef<HTMLDivElement | null>(null);
   const meterElRef = useRef<any>(null);
@@ -93,24 +99,64 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     handleCancelDrawing();
   }, [handleCancelDrawing]);
 
-  // Render simulated pins as AdvancedMarkers
+  // Render simulated pins as AdvancedMarkers (draggable; dblclick to delete)
   useEffect(() => {
     if (!mapRef.current) return;
     for (const m of simMarkerRefs.current) m.map = null;
     simMarkerRefs.current = [];
     if (window.google?.maps?.marker?.AdvancedMarkerElement) {
-      simMarkerRefs.current = results.map(
-        (p) =>
-          new window.google.maps.marker.AdvancedMarkerElement({
-            map: mapRef.current!,
-            position: p,
-          }),
-      );
+      simMarkerRefs.current = results.map((p, idx) => {
+        const marker = new window.google.maps.marker.AdvancedMarkerElement({
+          map: mapRef.current!,
+          position: p,
+          gmpDraggable: true,
+        });
+        marker.addListener("dragend", (e: google.maps.MapMouseEvent) => {
+          const pos = e.latLng?.toJSON();
+          if (!pos) return;
+          const next = results.slice();
+          let newPos = pos;
+          if (pinSnapToGrid && pinGridSizeDeg > 0) {
+            const snap = (v: number, step: number) => Math.round(v / step) * step;
+            newPos = { lat: snap(pos.lat, pinGridSizeDeg), lng: snap(pos.lng, pinGridSizeDeg) };
+          }
+          next[idx] = newPos;
+          onResultsChange(next);
+        });
+        const handleCtrlDoubleClick = (ev: any) => {
+          const ctrl = ev?.ctrlKey ?? ev?.domEvent?.ctrlKey ?? false;
+          if (!ctrl) return;
+          const next = results.slice();
+          next.splice(idx, 1);
+          onResultsChange(next);
+        };
+        // Support AdvancedMarker and regular double-click events
+        marker.addListener("gmp-dblclick", handleCtrlDoubleClick as any);
+        marker.addListener("dblclick", handleCtrlDoubleClick as any);
+        // Fallback: detect two ctrl+clicks within threshold
+        let lastCtrlClick = 0;
+        const handleCtrlClickFallback = (ev: any) => {
+          const ctrl = ev?.ctrlKey ?? ev?.domEvent?.ctrlKey ?? false;
+          if (!ctrl) return;
+          const now = Date.now();
+          if (now - lastCtrlClick < 350) {
+            const next = results.slice();
+            next.splice(idx, 1);
+            onResultsChange(next);
+            lastCtrlClick = 0;
+          } else {
+            lastCtrlClick = now;
+          }
+        };
+        marker.addListener("gmp-click", handleCtrlClickFallback as any);
+        marker.addListener("click", handleCtrlClickFallback as any);
+        return marker;
+      });
     }
     return () => {
       for (const m of simMarkerRefs.current) m.map = null;
     };
-  }, [results]);
+  }, [results, onResultsChange, pinSnapToGrid, pinGridSizeDeg]);
 
   // Initialize / update AdvancedMarker for primary pin
   useEffect(() => {
@@ -161,6 +207,15 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
             map.addListener("click", (e: google.maps.MapMouseEvent) => {
               const p = e.latLng?.toJSON();
               if (p) onCenterChange(p);
+            });
+            map.addListener("dragstart", () => {
+              isUserDraggingRef.current = true;
+            });
+            map.addListener("idle", () => {
+              if (!isUserDraggingRef.current) return;
+              const c = map.getCenter()?.toJSON();
+              if (c) onCenterChange(c);
+              isUserDraggingRef.current = false;
             });
           }}
         >
