@@ -1,5 +1,5 @@
 "use client";
-import { GoogleMap, LoadScript, DrawingManager, InfoWindow } from "@react-google-maps/api";
+import { GoogleMap, LoadScript, DrawingManager, OverlayView } from "@react-google-maps/api";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getBoundsFromShape, generatePinsWithinBounds } from "../utils/bounds";
 
@@ -99,6 +99,7 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     rating?: number;
     userRatingsTotal?: number;
     openNow?: boolean;
+    placeId?: string;
   } | null>(null);
   const geocodeCache = useRef<Map<string, string>>(new Map());
   const placesRef = useRef<google.maps.places.PlacesService | null>(null);
@@ -486,55 +487,96 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
               suppressHoverRef.current = false;
             }, 600);
             const p = e.latLng?.toJSON();
-            // If user clicked a POI, use placeId to fetch details and show
+            // If user clicked a POI, use Place.fetchFields (new Places SDK) to fetch details
             if ((e as any).placeId) {
               if (typeof (e as any).stop === "function") (e as any).stop();
               const placeId = (e as any).placeId as string;
-              if (placesRef.current) {
-                  setHoverAddress("");
-                  setHoverDetails(null);
-                  setValidation(null);
-                  placesRef.current.getDetails(
-                    {
-                      placeId,
-                      fields: [
-                        "name",
-                        "formatted_address",
-                        "geometry",
-                        "url",
-                        "website",
-                        "international_phone_number",
-                        "opening_hours",
-                        "rating",
-                        "user_ratings_total",
-                        "types",
-                        "place_id",
-                      ],
-                    },
-                    (place, status) => {
-                      if (status === google.maps.places.PlacesServiceStatus.OK && place) {
-                        const pos = place.geometry?.location?.toJSON() ?? p!;
-                        setHoverPosition(pos);
-                        const title = place.name ?? "";
-                        const addr = place.formatted_address ?? "";
-                        setHoverAddress(title ? `${title}, ${addr}` : addr);
-                        const openNow = place.opening_hours?.isOpen?.() ?? undefined;
-                        setHoverDetails({
-                          name: place.name ?? undefined,
-                          url: place.url ?? undefined,
-                          website: place.website ?? undefined,
-                          phone: place.international_phone_number ?? undefined,
-                          rating: place.rating ?? undefined,
-                          userRatingsTotal: place.user_ratings_total ?? undefined,
-                          openNow,
-                        });
-                        validateAddressIfEnabled(addr || title);
-                      }
-                    },
-                  );
+              setHoverAddress("");
+              setHoverDetails(null);
+              setValidation(null);
+              (async () => {
+                try {
+                  // New Places SDK
+                  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                  const placesLib: any = await (google.maps as any).importLibrary("places");
+                  const PlaceCtor = placesLib.Place as any;
+                  const place = new PlaceCtor({ id: placeId, requestedLanguage: "en" });
+                  await place.fetchFields({
+                    fields: [
+                      "displayName",
+                      "formattedAddress",
+                      "location",
+                      "rating",
+                      "userRatingCount",
+                      "currentOpeningHours",
+                      "internationalPhoneNumber",
+                      "websiteUri",
+                      "id",
+                    ],
+                  });
+                  const pos = place.location ? place.location.toJSON() : p!;
+                  setHoverPosition(pos);
+                  const title: string = place.displayName?.toString?.() ?? place.displayName ?? "";
+                  const addr: string = place.formattedAddress ?? "";
+                  setHoverAddress(title ? `${title}, ${addr}` : addr);
+                  const openNow = typeof place.currentOpeningHours?.openNow === "boolean" ? place.currentOpeningHours.openNow : undefined;
+                  setHoverDetails({
+                    name: title || undefined,
+                    url: undefined, // not exposed in new fields; keep undefined
+                    website: place.websiteUri ?? undefined,
+                    phone: place.internationalPhoneNumber ?? undefined,
+                    rating: typeof place.rating === "number" ? place.rating : undefined,
+                    userRatingsTotal: typeof place.userRatingCount === "number" ? place.userRatingCount : undefined,
+                    openNow,
+                    placeId: place.id ?? placeId,
+                  });
+                  validateAddressIfEnabled(addr || title);
+                } catch {
+                  // Fallback to legacy PlacesService if importLibrary or fields fail
+                  if (placesRef.current) {
+                    placesRef.current.getDetails(
+                      {
+                        placeId,
+                        fields: [
+                          "name",
+                          "formatted_address",
+                          "geometry",
+                          "url",
+                          "website",
+                          "international_phone_number",
+                          "opening_hours",
+                          "rating",
+                          "user_ratings_total",
+                          "place_id",
+                        ],
+                      },
+                      (place, status) => {
+                        if (status === google.maps.places.PlacesServiceStatus.OK && place) {
+                          const pos = place.geometry?.location?.toJSON() ?? p!;
+                          setHoverPosition(pos);
+                          const title = place.name ?? "";
+                          const addr = place.formatted_address ?? "";
+                          setHoverAddress(title ? `${title}, ${addr}` : addr);
+                          const openNow = place.opening_hours?.isOpen?.() ?? undefined;
+                          setHoverDetails({
+                            name: place.name ?? undefined,
+                            url: place.url ?? undefined,
+                            website: place.website ?? undefined,
+                            phone: place.international_phone_number ?? undefined,
+                            rating: place.rating ?? undefined,
+                            userRatingsTotal: place.user_ratings_total ?? undefined,
+                            openNow,
+                            placeId: place.place_id ?? undefined,
+                          });
+                          validateAddressIfEnabled(addr || title);
+                        }
+                      },
+                    );
+                  }
                 }
-                return;
-              }
+              })();
+              return;
+            }
               // Non-POI: show address for clicked lat/lng and also update center
               if (p) {
                 setHoverAddress("");
@@ -678,8 +720,11 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
             }}
           />
           {addressHover && hoverPosition && (
-            <InfoWindow position={hoverPosition} options={{ disableAutoPan: false }}>
-              <div className="max-w-xs rounded-md border bg-popover p-3 text-popover-foreground shadow">
+            <OverlayView position={hoverPosition} mapPaneName="floatPane">
+              <div
+                className="pointer-events-auto w-64 rounded-md border bg-popover p-3 text-popover-foreground shadow outline outline-1 outline-border"
+                style={{ transform: "translate(-50%, -100%) translateY(-10px)" }}
+              >
                 {hoverAddress ? (
                   <div className="space-y-1.5">
                     <div className="font-semibold leading-snug">
@@ -698,7 +743,7 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
                     )}
                     {typeof hoverDetails?.openNow === "boolean" && (
                       <div className="text-xs">
-                        <span className={`rounded px-1 ${hoverDetails.openNow ? "bg-green-500/15 text-green-600" : "bg-red-500/15 text-red-600"}`}>
+                        <span className={`${hoverDetails.openNow ? "bg-green-500/15 text-green-600" : "bg-red-500/15 text-red-600"} rounded px-1`}>
                           {hoverDetails.openNow ? "Open now" : "Closed now"}
                         </span>
                       </div>
@@ -706,16 +751,39 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
                     {hoverDetails?.phone && (
                       <div className="text-xs text-muted-foreground">{hoverDetails.phone}</div>
                     )}
-                    <div className="flex flex-wrap gap-3 pt-1">
+                    <div className="flex flex-wrap items-center gap-3 pt-1">
+                      {/* Open in Maps */}
                       <a
                         className="text-primary text-sm underline"
                         href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-                          `${hoverPosition.lat},${hoverPosition.lng}`,
-                        )}`}
+                          hoverDetails?.placeId ? "" : `${hoverPosition.lat},${hoverPosition.lng}`,
+                        )}${hoverDetails?.placeId ? `&query_place_id=${hoverDetails.placeId}` : ""}`}
                         target="_blank"
                         rel="noreferrer"
                       >
-                        View on Google Maps
+                        Open in Google Maps
+                      </a>
+                      {/* Directions */}
+                      <a
+                        className="text-primary text-sm underline"
+                        href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(
+                          hoverDetails?.placeId ? "" : `${hoverPosition.lat},${hoverPosition.lng}`,
+                        )}${hoverDetails?.placeId ? `&destination_place_id=${hoverDetails.placeId}` : ""}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Directions
+                      </a>
+                      {/* Nearby (Restaurants) */}
+                      <a
+                        className="text-primary text-sm underline"
+                        href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
+                          `restaurants near ${hoverPosition.lat},${hoverPosition.lng}`,
+                        )}${hoverDetails?.placeId ? `&query_place_id=${hoverDetails.placeId}` : ""}`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Nearby
                       </a>
                       {hoverDetails?.website && (
                         <a className="text-primary text-sm underline" href={hoverDetails.website} target="_blank" rel="noreferrer">
@@ -749,7 +817,7 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
                   </div>
                 )}
               </div>
-            </InfoWindow>
+            </OverlayView>
           )}
         </GoogleMap>
       </div>
