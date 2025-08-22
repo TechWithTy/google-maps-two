@@ -1,7 +1,10 @@
 "use client";
-import { GoogleMap, LoadScript, DrawingManager, OverlayView } from "@react-google-maps/api";
+import { GoogleMap, LoadScript, DrawingManager } from "@react-google-maps/api";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getBoundsFromShape, generatePinsWithinBounds } from "../utils/bounds";
+import { AirQualityMount } from "./map/AirQualityMount";
+import { DrawingControls } from "./map/DrawingControls";
+import { HoverOverlay } from "./map/HoverOverlay";
 
 export type MapWithDrawingProps = {
   apiKey: string;
@@ -36,6 +39,25 @@ export type MapWithDrawingProps = {
   }) => void;
   // Map color scheme: light, dark, or follow system/app theme
   mapColorScheme?: "light" | "dark" | "system";
+  // Optional external selection: when provided, fetch details and open popover
+  selectedPlace?: { placeId?: string; location?: google.maps.LatLngLiteral } | null;
+  // Actions from popover
+  onViewPlace?: (payload: {
+    placeId?: string;
+    position: google.maps.LatLngLiteral;
+    name?: string;
+    address?: string;
+    googleMapsUri?: string;
+    website?: string;
+  }) => void;
+  onAddToList?: (payload: {
+    placeId?: string;
+    position: google.maps.LatLngLiteral;
+    name?: string;
+    address?: string;
+    googleMapsUri?: string;
+    website?: string;
+  }) => void;
 };
 
 const defaultContainer = { width: "100%", height: "500px" } as const;
@@ -63,6 +85,9 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     validatePinsBeforeRender = true,
     onPinValidated,
     mapColorScheme = "system",
+    selectedPlace,
+    onViewPlace,
+    onAddToList,
   } = props;
 
   // Compute final flag with backward compatibility
@@ -93,6 +118,7 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
   const [hoverAddress, setHoverAddress] = useState<string>("");
   const [hoverDetails, setHoverDetails] = useState<{
     name?: string;
+    formattedAddress?: string;
     url?: string;
     website?: string;
     phone?: string;
@@ -100,17 +126,44 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     userRatingsTotal?: number;
     openNow?: boolean;
     placeId?: string;
+    googleMapsUri?: string;
+    priceLevel?: number;
+    businessStatus?: string;
+    hoursToday?: string;
+    editorialSummary?: string;
+    photos?: any[];
+    reviews?: any[];
+    country?: string;
+    addressType?: string; // e.g., street_address, premise, plus_code, route
   } | null>(null);
   const geocodeCache = useRef<Map<string, string>>(new Map());
   const placesRef = useRef<google.maps.places.PlacesService | null>(null);
   const geocodeReqId = useRef(0);
   const [validating, setValidating] = useState(false);
   const [validation, setValidation] = useState<any | null>(null);
+  const [reviewsExpanded, setReviewsExpanded] = useState(false);
+  const [lightboxUrl, setLightboxUrl] = useState<string | null>(null);
   // Suppress hover popover right after a click to avoid double popover
   const suppressHoverRef = useRef(false);
   // Color scheme readiness and enum
   const [colorSchemeEnum, setColorSchemeEnum] = useState<google.maps.ColorScheme | undefined>(undefined);
   const [googleReady, setGoogleReady] = useState(false);
+
+  // Helper to safely extract a photo URL from various SDK shapes
+  const getPhotoUrl = useCallback((photo: any, size = 320): string | null => {
+    try {
+      if (!photo) return null;
+      if (typeof photo.getURI === "function") {
+        return photo.getURI({ maxHeight: size, maxWidth: size });
+      }
+      if (typeof photo.getUrl === "function") {
+        return photo.getUrl({ maxWidth: size, maxHeight: size });
+      }
+      if (typeof photo === "string") return photo;
+      if (photo?.url) return photo.url;
+    } catch {}
+    return null;
+  }, []);
 
   const clearShape = useCallback(() => {
     if (shapeRef.current) {
@@ -413,6 +466,7 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     const cached = geocodeCache.current.get(key);
     if (cached !== undefined) {
       setHoverAddress(cached);
+      // Keep previous details if any; don't overwrite on cache hit
       return;
     }
     const reqId = ++geocodeReqId.current;
@@ -420,9 +474,27 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
       const geocoder = new google.maps.Geocoder();
       geocoder.geocode({ location: pos }, (results, status) => {
         if (reqId !== geocodeReqId.current) return; // stale response
-        const addr = status === "OK" && results && results[0] ? results[0].formatted_address ?? "" : "";
+        const primary = status === "OK" && results && results[0] ? results[0] : null;
+        const addr = primary?.formatted_address ?? "";
         geocodeCache.current.set(key, addr);
         setHoverAddress(addr);
+        if (primary) {
+          const get = (type: string, short = false) =>
+            primary.address_components?.find((c) => c.types.includes(type))?.[short ? "short_name" : "long_name"];
+          setHoverDetails((prev) => ({
+            ...(prev || {}),
+            formattedAddress: addr || undefined,
+            neighborhood: get("neighborhood") || get("sublocality") || get("sublocality_level_1") || undefined,
+            city: get("locality") || get("postal_town") || undefined,
+            county: get("administrative_area_level_2") || undefined,
+            state: get("administrative_area_level_1", true) || get("administrative_area_level_1") || undefined,
+            postalCode: get("postal_code") || undefined,
+            country: get("country", true) || undefined,
+            addressType: primary.types?.[0] || undefined,
+            // ensure we don't show business-only fields for residential-only addresses
+            placeId: (prev?.placeId ? prev.placeId : undefined),
+          }));
+        }
       });
     } catch {
       if (reqId === geocodeReqId.current) setHoverAddress("");
@@ -512,6 +584,12 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
                       "internationalPhoneNumber",
                       "websiteUri",
                       "id",
+                      "googleMapsUri",
+                      "priceLevel",
+                      "businessStatus",
+                      "editorialSummary",
+                      "photos",
+                      "reviews",
                     ],
                   });
                   const pos = place.location ? place.location.toJSON() : p!;
@@ -522,6 +600,7 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
                   const openNow = typeof place.currentOpeningHours?.openNow === "boolean" ? place.currentOpeningHours.openNow : undefined;
                   setHoverDetails({
                     name: title || undefined,
+                    formattedAddress: addr || undefined,
                     url: undefined, // not exposed in new fields; keep undefined
                     website: place.websiteUri ?? undefined,
                     phone: place.internationalPhoneNumber ?? undefined,
@@ -529,6 +608,15 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
                     userRatingsTotal: typeof place.userRatingCount === "number" ? place.userRatingCount : undefined,
                     openNow,
                     placeId: place.id ?? placeId,
+                    googleMapsUri: place.googleMapsUri ?? undefined,
+                    priceLevel: typeof place.priceLevel === "number" ? place.priceLevel : undefined,
+                    businessStatus: place.businessStatus ?? undefined,
+                    hoursToday: Array.isArray(place.currentOpeningHours?.weekdayDescriptions)
+                      ? place.currentOpeningHours.weekdayDescriptions[new Date().getDay() === 0 ? 6 : new Date().getDay() - 1]
+                      : undefined,
+                    editorialSummary: typeof place.editorialSummary?.text === "string" ? place.editorialSummary.text : undefined,
+                    photos: Array.isArray(place.photos) ? place.photos.slice(0, 6) : undefined,
+                    reviews: Array.isArray(place.reviews) ? place.reviews.slice(0, 3) : undefined,
                   });
                   validateAddressIfEnabled(addr || title);
                 } catch {
@@ -548,6 +636,15 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
                           "rating",
                           "user_ratings_total",
                           "place_id",
+                          // best-effort legacy extras
+                          // @ts-ignore
+                          "price_level",
+                          // @ts-ignore
+                          "business_status",
+                          // @ts-ignore
+                          "photos",
+                          // @ts-ignore
+                          "reviews",
                         ],
                       },
                       (place, status) => {
@@ -560,6 +657,7 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
                           const openNow = place.opening_hours?.isOpen?.() ?? undefined;
                           setHoverDetails({
                             name: place.name ?? undefined,
+                            formattedAddress: place.formatted_address ?? undefined,
                             url: place.url ?? undefined,
                             website: place.website ?? undefined,
                             phone: place.international_phone_number ?? undefined,
@@ -567,6 +665,15 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
                             userRatingsTotal: place.user_ratings_total ?? undefined,
                             openNow,
                             placeId: place.place_id ?? undefined,
+                            googleMapsUri: place.url ?? undefined,
+                            // @ts-ignore legacy typings
+                            priceLevel: typeof (place as any).price_level === "number" ? (place as any).price_level : undefined,
+                            // @ts-ignore legacy typings
+                            businessStatus: (place as any).business_status ?? undefined,
+                            // @ts-ignore legacy typings
+                            photos: Array.isArray((place as any).photos) ? (place as any).photos.slice(0, 6) : undefined,
+                            // @ts-ignore legacy typings
+                            reviews: Array.isArray((place as any).reviews) ? (place as any).reviews.slice(0, 3) : undefined,
                           });
                           validateAddressIfEnabled(addr || title);
                         }
@@ -622,86 +729,33 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
                   }}
                 />
               )}
+          {/* Lightbox overlay */}
+          {lightboxUrl && (
+            <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70" style={{ pointerEvents: "auto" }}>
+              <div className="relative max-h-[90%] max-w-[90%]">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={lightboxUrl} alt="Preview" className="max-h-[90vh] max-w-[90vw] rounded object-contain" />
+                <button
+                  type="button"
+                  className="absolute right-2 top-2 rounded bg-white/90 px-2 py-1 text-xs text-black"
+                  onClick={() => setLightboxUrl(null)}
+                >
+                  Close
+                </button>
+              </div>
             </div>
           )}
-          {!boundaryApplied && (
-            <div
-              className="-translate-x-1/2 absolute top-10 left-1/2 z-10 transform rounded-lg bg-white p-2 text-center opacity-80 shadow-lg transition-opacity duration-300 hover:opacity-100 lg:top-2"
-              style={{ pointerEvents: "auto" }}
-            >
-              {!drawingMode ? (
-                <p className="mb-2 font-semibold text-gray-800 text-sm">
-                  Draw a shape to search in that area
-                </p>
-              ) : (
-                <p className="mb-2 font-semibold text-gray-800 text-sm">Start Drawing!</p>
-              )}
-              {!shapeDrawn && (
-                <div className="mb-2 flex flex-col items-center space-y-2">
-                  <div className="flex justify-center space-x-2">
-                    <button
-                      type="button"
-                      className="rounded bg-blue-600 px-4 py-2 text-white text-xs hover:bg-blue-700"
-                      onClick={() => setDrawingMode(google.maps.drawing.OverlayType.POLYGON)}
-                    >
-                      Polygon
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded bg-blue-600 px-4 py-2 text-white text-xs hover:bg-blue-700"
-                      onClick={() => setDrawingMode(google.maps.drawing.OverlayType.RECTANGLE)}
-                    >
-                      Rectangle
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded bg-blue-600 px-4 py-2 text-white text-xs hover:bg-blue-700"
-                      onClick={() => setDrawingMode(google.maps.drawing.OverlayType.CIRCLE)}
-                    >
-                      Circle
-                    </button>
-                  </div>
-                  {drawingMode && (
-                    <button
-                      type="button"
-                      className="mt-2 rounded bg-red-600 px-4 py-2 text-white text-xs hover:bg-red-700"
-                      onClick={handleCancelDrawing}
-                    >
-                      Cancel Drawing
-                    </button>
-                  )}
-                </div>
-              )}
-              {shapeDrawn && (
-                <div className="flex justify-center space-x-4">
-                  <button
-                    type="button"
-                    onClick={handleCancelDrawing}
-                    className="rounded bg-gray-300 px-4 py-1 text-black shadow hover:bg-gray-400"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleApplyDrawing}
-                    className="rounded bg-blue-600 px-4 py-1 text-white shadow hover:bg-blue-700"
-                  >
-                    Apply
-                  </button>
-                </div>
-              )}
             </div>
           )}
-          {boundaryApplied && (
-            <button
-              onClick={handleRemoveBoundaries}
-              type="button"
-              className="absolute top-4 right-4 z-10 flex cursor-pointer items-center rounded-lg bg-red-500 px-4 py-2 text-white shadow-lg hover:bg-red-600"
-            >
-              <span className="mr-2">Remove Boundaries</span>
-              <button type="button">&#x2715;</button>
-            </button>
-          )}
+          <DrawingControls
+            drawingMode={drawingMode}
+            setDrawingMode={setDrawingMode}
+            shapeDrawn={shapeDrawn}
+            boundaryApplied={boundaryApplied}
+            onCancelDrawing={handleCancelDrawing}
+            onApplyDrawing={handleApplyDrawing}
+            onRemoveBoundaries={handleRemoveBoundaries}
+          />
           <DrawingManager
             onPolygonComplete={onShapeComplete}
             onRectangleComplete={onShapeComplete}
@@ -720,135 +774,22 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
             }}
           />
           {addressHover && hoverPosition && (
-            <OverlayView position={hoverPosition} mapPaneName="floatPane">
-              <div
-                className="pointer-events-auto w-64 rounded-md border bg-popover p-3 text-popover-foreground shadow outline outline-1 outline-border"
-                style={{ transform: "translate(-50%, -100%) translateY(-10px)" }}
-              >
-                {hoverAddress ? (
-                  <div className="space-y-1.5">
-                    <div className="font-semibold leading-snug">
-                      <span className="rounded bg-primary/15 px-1">
-                        {hoverDetails?.name ?? hoverAddress.split(",")[0]}
-                      </span>
-                    </div>
-                    <div className="text-sm text-muted-foreground">
-                      {hoverDetails?.name ? hoverAddress.replace(/^.*?,\s*/, "") : hoverAddress.split(",").slice(1).join(",").trim()}
-                    </div>
-                    {typeof hoverDetails?.rating === "number" && (
-                      <div className="text-xs text-muted-foreground">
-                        Rating: <span className="font-medium text-foreground">{hoverDetails.rating.toFixed(1)}</span>
-                        {typeof hoverDetails.userRatingsTotal === "number" && ` (${hoverDetails.userRatingsTotal})`}
-                      </div>
-                    )}
-                    {typeof hoverDetails?.openNow === "boolean" && (
-                      <div className="text-xs">
-                        <span className={`${hoverDetails.openNow ? "bg-green-500/15 text-green-600" : "bg-red-500/15 text-red-600"} rounded px-1`}>
-                          {hoverDetails.openNow ? "Open now" : "Closed now"}
-                        </span>
-                      </div>
-                    )}
-                    {hoverDetails?.phone && (
-                      <div className="text-xs text-muted-foreground">{hoverDetails.phone}</div>
-                    )}
-                    <div className="flex flex-wrap items-center gap-3 pt-1">
-                      {/* Open in Maps */}
-                      <a
-                        className="text-primary text-sm underline"
-                        href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-                          hoverDetails?.placeId ? "" : `${hoverPosition.lat},${hoverPosition.lng}`,
-                        )}${hoverDetails?.placeId ? `&query_place_id=${hoverDetails.placeId}` : ""}`}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        Open in Google Maps
-                      </a>
-                      {/* Directions */}
-                      <a
-                        className="text-primary text-sm underline"
-                        href={`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(
-                          hoverDetails?.placeId ? "" : `${hoverPosition.lat},${hoverPosition.lng}`,
-                        )}${hoverDetails?.placeId ? `&destination_place_id=${hoverDetails.placeId}` : ""}`}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        Directions
-                      </a>
-                      {/* Nearby (Restaurants) */}
-                      <a
-                        className="text-primary text-sm underline"
-                        href={`https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(
-                          `restaurants near ${hoverPosition.lat},${hoverPosition.lng}`,
-                        )}${hoverDetails?.placeId ? `&query_place_id=${hoverDetails.placeId}` : ""}`}
-                        target="_blank"
-                        rel="noreferrer"
-                      >
-                        Nearby
-                      </a>
-                      {hoverDetails?.website && (
-                        <a className="text-primary text-sm underline" href={hoverDetails.website} target="_blank" rel="noreferrer">
-                          Website
-                        </a>
-                      )}
-                      {hoverDetails?.url && (
-                        <a className="text-primary text-sm underline" href={hoverDetails.url} target="_blank" rel="noreferrer">
-                          Place page
-                        </a>
-                      )}
-                    </div>
-                    {validation && (
-                      <div className="mt-2 rounded border bg-card p-2 text-xs">
-                        <div className="font-medium">Validation</div>
-                        <div className="text-muted-foreground">Formatted: {validation.address?.formattedAddress || ""}</div>
-                        <div className="text-muted-foreground">Entered: {validation.verdict?.inputGranularity || ""}</div>
-                        <div className="text-muted-foreground">Validated: {validation.verdict?.validationGranularity || ""}</div>
-                        <div className="text-muted-foreground">Complete: {String(validation.verdict?.addressComplete)}</div>
-                        <div className="text-muted-foreground">Unconfirmed: {String(validation.verdict?.hasUnconfirmedComponents)}</div>
-                      </div>
-                    )}
-                    {validating && (
-                      <div className="text-xs text-muted-foreground">Validating…</div>
-                    )}
-                  </div>
-                ) : (
-                  <div className="flex items-center gap-2 text-sm text-muted-foreground">
-                    <span className="inline-block h-3 w-3 animate-pulse rounded-full bg-muted" />
-                    Fetching address…
-                  </div>
-                )}
-              </div>
-            </OverlayView>
+            <HoverOverlay
+              position={hoverPosition}
+              address={hoverAddress}
+              details={hoverDetails}
+              validation={validation}
+              validating={validating}
+              reviewsExpanded={reviewsExpanded}
+              setReviewsExpanded={setReviewsExpanded}
+              getPhotoUrl={getPhotoUrl}
+              setLightboxUrl={setLightboxUrl}
+              onViewPlace={onViewPlace}
+              onAddToList={onAddToList}
+            />
           )}
         </GoogleMap>
       </div>
     </LoadScript>
   );
-}
-
-// Helper component to mount the Air Quality custom element lazily
-function AirQualityMount({
-  center,
-  onReady,
-}: {
-  center: google.maps.LatLngLiteral;
-  onReady: (el: any) => void;
-}) {
-  const containerRef = useRef<HTMLDivElement | null>(null);
-  useEffect(() => {
-    // Always create the custom element tag; avoid experimental constructors
-    const el: any = document.createElement("gmp-air-quality-meter");
-    el.setAttribute("location", `${center.lat},${center.lng}`);
-    if (containerRef.current) containerRef.current.appendChild(el);
-    onReady(el);
-    return () => {
-      try {
-        if (containerRef.current && el && containerRef.current.contains(el)) {
-          containerRef.current.removeChild(el);
-        }
-      } catch {
-        // noop
-      }
-    };
-  }, []);
-  return <div ref={containerRef} />;
 }
