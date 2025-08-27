@@ -110,7 +110,7 @@ function HoverOverlayImpl({
             )}
             {typeof details?.openNow === "boolean" && (
               <div className="text-xs">
-                <span className={`${details.openNow ? "bg-green-500/15 text-green-600" : "bg-red-500/15 text-red-600"} rounded px-1`}>
+                <span className={`${details.openNow ? "bg-primary/15 text-primary" : "bg-destructive/15 text-destructive"} rounded px-1`}>
                   {details.openNow ? "Open now" : "Closed now"}
                 </span>
               </div>

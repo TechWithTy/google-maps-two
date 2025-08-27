@@ -148,6 +148,8 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
   // Color scheme readiness and enum
   const [colorSchemeEnum, setColorSchemeEnum] = useState<google.maps.ColorScheme | undefined>(undefined);
   const [googleReady, setGoogleReady] = useState(false);
+  // Theme token HSL strings from CSS variables (no external util): e.g., "210 40% 98%"
+  const [themeHsl, setThemeHsl] = useState<{ primary: string; background: string }>({ primary: "", background: "" });
 
   // Helper to safely extract a photo URL from various SDK shapes
   const getPhotoUrl = useCallback((photo: any, size = 320): string | null => {
@@ -205,6 +207,20 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
     };
   }, [googleReady, mapColorScheme]);
 
+  // Read CSS variables for tokens (HSL triplets) so we can feed Google Maps colors
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const root = document.documentElement;
+      const styles = getComputedStyle(root);
+      const primary = styles.getPropertyValue("--primary").trim();
+      const background = styles.getPropertyValue("--background").trim();
+      setThemeHsl({ primary, background });
+    } catch {
+      // no-op
+    }
+  }, [googleReady, mapColorScheme]);
+
   // Track theme changes and remount map when scheme should change
   const [mapKey, setMapKey] = useState(0);
   useEffect(() => {
@@ -243,6 +259,21 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
       observer.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
       // Initial check
       evalAndSet();
+      // Also refresh CSS variable-derived colors on theme class changes
+      const refreshCssVars = () => {
+        try {
+          const styles = getComputedStyle(document.documentElement);
+          const primary = styles.getPropertyValue("--primary").trim();
+          const background = styles.getPropertyValue("--background").trim();
+          setThemeHsl((prev) => (prev.primary !== primary || prev.background !== background ? { primary, background } : prev));
+        } catch {
+          // ignore
+        }
+      };
+      refreshCssVars();
+      const mo = new MutationObserver(refreshCssVars);
+      mo.observe(document.documentElement, { attributes: true, attributeFilter: ["class"] });
+      observer = mo;
       // Cleanup
       return () => {
         mql.removeEventListener?.("change", mqlHandler);
@@ -530,7 +561,7 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
       libraries={libraries}
       onLoad={() => setGoogleReady(true)}
     >
-    <div style={{ position: "relative", width: "100%", height: containerStyle.height }}>
+    <div className="bg-background" style={{ position: "relative", width: "100%", height: containerStyle.height }}>
       <GoogleMap
         key={`map-${mapKey}-${colorSchemeEnum ?? "default"}`}
         mapContainerStyle={containerStyle}
@@ -541,7 +572,8 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
           disableDefaultUI: true,
           clickableIcons: true,
           gestureHandling: "greedy",
-          backgroundColor: "#0B0B0C",
+          // Use theme background if available; otherwise let Google default
+          backgroundColor: themeHsl.background ? (`hsl(${themeHsl.background})` as unknown as string) : undefined,
           ...(colorSchemeEnum ? { colorScheme: colorSchemeEnum } : {}),
           mapId: mapId,
         }}
@@ -731,13 +763,13 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
               )}
           {/* Lightbox overlay */}
           {lightboxUrl && (
-            <div className="absolute inset-0 z-50 flex items-center justify-center bg-black/70" style={{ pointerEvents: "auto" }}>
+            <div className="absolute inset-0 z-50 flex items-center justify-center bg-background/70" style={{ pointerEvents: "auto" }}>
               <div className="relative max-h-[90%] max-w-[90%]">
                 {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img src={lightboxUrl} alt="Preview" className="max-h-[90vh] max-w-[90vw] rounded object-contain" />
                 <button
                   type="button"
-                  className="absolute right-2 top-2 rounded bg-white/90 px-2 py-1 text-xs text-black"
+                  className="absolute right-2 top-2 rounded bg-card/90 px-2 py-1 text-xs text-foreground border border-border"
                   onClick={() => setLightboxUrl(null)}
                 >
                   Close
@@ -764,8 +796,10 @@ export function MapWithDrawing(props: MapWithDrawingProps) {
               drawingControl: false,
               drawingMode: drawingMode,
               polygonOptions: {
-                fillColor: "#2196F3",
+                // Use theme primary for shapes if available
+                fillColor: themeHsl.primary ? (`hsl(${themeHsl.primary})` as unknown as string) : undefined,
                 fillOpacity: 0.5,
+                strokeColor: themeHsl.primary ? (`hsl(${themeHsl.primary})` as unknown as string) : undefined,
                 strokeWeight: 2,
                 clickable: false,
                 editable: true,
