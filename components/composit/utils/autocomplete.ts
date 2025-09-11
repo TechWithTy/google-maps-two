@@ -1,13 +1,24 @@
 export interface ACSeed {
   placeId?: string;
   location?: google.maps.LatLngLiteral;
+  formattedAddress?: string;
+  name?: string;
 }
 
 export type PlaceChangedHandler = (seed: ACSeed) => void;
 
+export interface ACOptions {
+  fields?: string[];
+  types?: string[];
+  // e.g., { country: 'us' }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  componentRestrictions?: any;
+}
+
 export async function initAutocomplete(
   input: HTMLInputElement,
   onPlaceChanged: PlaceChangedHandler,
+  options?: ACOptions,
 ): Promise<() => void> {
   // SSR guard
   if (typeof window === "undefined") {
@@ -36,16 +47,19 @@ export async function initAutocomplete(
     const AutocompleteCtor = (placesLib as any)?.Autocomplete || ((window as any).google?.maps as any)?.places?.Autocomplete;
     if (!AutocompleteCtor) throw new Error("AutocompleteCtor missing");
     ac = new AutocompleteCtor(input, {
-      fields: ["place_id", "geometry", "name", "formatted_address"],
-      types: ["geocode"],
+      fields: options?.fields || ["place_id", "geometry", "name", "formatted_address"],
+      // When types is undefined, Google shows a broad set (cities, addresses, POIs)
+      types: options?.types,
+      componentRestrictions: options?.componentRestrictions,
     });
   } catch {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const LegacyAC = ((window as any).google?.maps as any)?.places?.Autocomplete;
     if (LegacyAC) {
       ac = new LegacyAC(input, {
-        fields: ["place_id", "geometry", "name", "formatted_address"],
-        types: ["geocode"],
+        fields: options?.fields || ["place_id", "geometry", "name", "formatted_address"],
+        types: options?.types,
+        componentRestrictions: options?.componentRestrictions,
       });
     }
   }
@@ -55,8 +69,12 @@ export async function initAutocomplete(
       const place = ac.getPlace?.();
       const loc = place?.geometry?.location?.toJSON?.();
       const pid = place?.place_id as string | undefined;
+      const formattedAddress = place?.formatted_address as string | undefined;
+      const name = place?.name as string | undefined;
       if (loc && Number.isFinite(loc.lat) && Number.isFinite(loc.lng)) {
-        onPlaceChanged({ placeId: pid, location: loc });
+        onPlaceChanged({ placeId: pid, location: loc, formattedAddress, name });
+      } else if (formattedAddress) {
+        onPlaceChanged({ placeId: pid, formattedAddress });
       }
     });
   }
